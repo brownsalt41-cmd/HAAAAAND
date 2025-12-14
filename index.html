@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>Hand-Particle Interactive Experience</title>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-core@4.17.0/dist/tf-core.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgl@4.17.0/dist/tf-backend-webgl.min.js"></script>
+</head>
+<body>
+    <video id="webcam" style="display: none;"></video>
+    <canvas id="canvas"></canvas>
+    <div id="loading-screen">Loading models... Please allow camera access.</div>
+
+    <style>
+        /* CSS embedded for a single-file solution */
+        body { margin: 0; overflow: hidden; background-color: #000; }
+        #canvas { display: block; position: fixed; top: 0; left: 0; }
+        #loading-screen {
+            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0, 0, 0, 0.9); color: #fff; z-index: 100;
+            display: flex; justify-content: center; align-items: center;
+            font-family: sans-serif; font-size: 1.2em; text-align: center;
+        }
+    </style>
+
+    <script>
+        // --- Core Application Logic Embedded Here ---
+        document.addEventListener('DOMContentLoaded', () => {
+            // Wait for the DOM to be ready before starting the setup function
+            setupApp();
+        });
+
+        // Global state for hand tracking and rendering
+        const STATE = {
+            handPosition: new THREE.Vector3(0, 0, 0), // Normalized x, y, z
+            handOpenness: 0, // 0 (closed fist) to 1 (open hand)
+            isTracking: false,
+            trackingFPS: 0
+        };
+
+        // --- PART 1: SETUP AND INITIALIZATION ---
+        async function setupApp() {
+            // 1. Initialize WebGL Backend for MediaPipe
+            await tf.setBackend('webgl');
+            await tf.ready();
+
+            // 2. Setup Three.js Scene and Renderer
+            const canvas = document.getElementById('canvas');
+            const renderer = new THREE.WebGLRenderer({ canvas: canvas, antialias: true, alpha: true });
+            renderer.setPixelRatio(window.devicePixelRatio > 1.5 ? 1.0 : 1.0); // Mobile optimization: lower pixel ratio
+            renderer.setSize(window.innerWidth, window.innerHeight);
+
+            const scene = new THREE.Scene();
+            const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.z = 5; // Look at the particle system
+
+            // Resize listener for mobile orientation changes
+            window.addEventListener('resize', () => {
+                renderer.setSize(window.innerWidth, window.innerHeight);
+                camera.aspect = window.innerWidth / window.innerHeight;
+                camera.updateProjectionMatrix();
+            });
+            
+            // 3. Setup Particles
+            const particleSystem = createParticleSystem();
+            scene.add(particleSystem);
+            
+            // 4. Setup Webcam and MediaPipe
+            const webcamElement = document.getElementById('webcam');
+            await setupWebcam(webcamElement);
+            await setupMediaPipe(webcamElement);
+            
+            // 5. Start the Render Loop
+            document.getElementById('loading-screen').style.display = 'none';
+            animate(renderer, scene, camera, particleSystem);
+        }
+
+        // --- PART 2: WEBCAM AND MEDIAPIPE SETUP ---
+
+        async function setupWebcam(webcamElement) {
+            try {
+                // Request camera access. Prefer front camera for interactive use.
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    video: {
+                        facingMode: 'user', // Front camera
+                        width: 640, // Low resolution for mobile performance
+                        height: 480
+                    }
+                });
+                webcamElement.srcObject = stream;
+                return new Promise((resolve) => {
+                    webcamElement.onloadedmetadata = () => {
+                        webcamElement.play();
+                        resolve();
+                    };
+                });
+            } catch (error) {
+                console.error("Could not access the camera: ", error);
+                document.getElementById('loading-screen').innerText = 'ERROR: Could not access camera. Please check permissions.';
+            }
+        }
+        
+        async function setupMediaPipe(webcamElement) {
+            // Initialize the MediaPipe Hands solution
+            const hands = new Hands({
+                locateFile: (file) => {
+                    return `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${file}`;
+                }
+            });
+
+            // Mobile/Performance optimization settings
+            hands.setOptions({
+                maxNumHands: 1, // Crucial for performance
+                modelComplexity: 0, // 0 is 'lite' model for speed
+                minDetectionConfidence: 0.7,
+                minTrackingConfidence: 0.5
+            });
+
+            // Result handler
+            hands.onResults((results) => {
+                STATE.isTracking = results.multiHandLandmarks && results.multiHandLandmarks.length > 0;
+                
+                if (STATE.isTracking) {
+                    // We only track the first hand (maxNumHands: 1)
+                    const handLandmarks = results.multiHandLandmarks[0];
+                    
+                    // The 'wrist' (0) is a good anchor for the hand's main position
+                    const wrist = handLandmarks[0];
+                    
+                    // Normalize position from (0 to 1) to (-1 to 1) for the scene
+                    const newX = (wrist.x - 0.5) * 6; // Scale for visual effect
+                    const newY = -(wrist.y - 0.5) * 6;
+                    // wrist.z gives a rough depth estimate, map it to a smaller range
+                    const newZ = -wrist.z * 5; 
+
+                    // Smooth Easing: Blend current position with new position
+                    const easingFactor = 0.1; // Smoothness: lower is smoother
+                    STATE.handPosition.x += (newX - STATE.handPosition.x) * easingFactor;
+                    STATE.handPosition.y += (newY - STATE.handPosition.y) * easingFactor;
+                    STATE.handPosition.z += (newZ - STATE.handPosition.z) * easingFactor;
+
+                    // Hand Openness (0 to 1): Use the distance between thumb tip (4) and pinky tip (20)
+                    const thumbTip = handLandmarks[4];
+                    const pinkyTip = handLandmarks[20];
+                    const distance = Math.sqrt(
+                        Math.pow(thumbTip.x - pinkyTip.x, 2) + 
+                        Math.pow(thumbTip.y - pinkyTip.y, 2)
+                    );
+                    
+                    // Map distance to openness (calibration needed for different phones)
+                    // Example range: 0.1 (closed) to 0.4 (open)
+                    STATE.handOpenness = THREE.MathUtils.clamp(
+                        THREE.MathUtils.mapLinear(distance, 0.1, 0.4, 0.0, 1.0), 
+                        0, 1
+                    );
+                }
+                
+                // Continue to request the next frame
+                // Note: The hands.send() in the render loop handles the FPS throttle.
+            });
+            
+            // Start the video processing loop
+            const sendToMediaPipe = async () => {
+                if (webcamElement.readyState >= 2) { // Ensure video is ready
+                    await hands.send({ image: webcamElement });
+                }
+                // Request animation frame for smooth, throttled updates
+                requestAnimationFrame(sendToMediaPipe);
+            };
+            
+            // Give the webcam a moment to stabilize before sending the first frame
+            setTimeout(sendToMediaPipe, 500);
+        }
+
+        // --- PART 3: THREE.JS PARTICLE SYSTEM ---
+
+        function createParticleSystem() {
+            const particleCount = 20000; // Optimized number for mobile performance
+            const particlesGeometry = new THREE.BufferGeometry();
+            
+            const positions = new Float32Array(particleCount * 3);
+            const velocities = new Float32Array(particleCount * 3);
+            const sizes = new Float32Array(particleCount);
+            const colors = new Float32Array(particleCount * 3);
+
+            const color1 = new THREE.Color(0x40e0d0); // Turquoise/Cyan
+            const color2 = new THREE.Color(0xff69b4); // Hot Pink
+
+            for (let i = 0; i < particleCount; i++) {
+                // Initial random positions within a small cube
+                positions[i * 3 + 0] = (Math.random() - 0.5) * 5; 
+                positions[i * 3 + 1] = (Math.random() - 0.5) * 5;
+                positions[i * 3 + 2] = (Math.random() - 0.5) * 5;
+                
+                // Initial random velocity (small movement)
+                velocities[i * 3 + 0] = (Math.random() - 0.5) * 0.01; 
+                velocities[i * 3 + 1] = (Math.random() - 0.5) * 0.01;
+                velocities[i * 3 + 2] = (Math.random() - 0.5) * 0.01;
+                
+                sizes[i] = Math.random() * 20 + 5; // Particle size attribute
+                
+                // Soft color gradient based on index/position
+                const color = color1.clone().lerp(color2, i / particleCount);
+                colors[i * 3 + 0] = color.r;
+                colors[i * 3 + 1] = color.g;
+                colors[i * 3 + 2] = color.b;
+            }
+
+            particlesGeometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+            particlesGeometry.setAttribute('velocity', new THREE.BufferAttribute(velocities, 3));
+            particlesGeometry.setAttribute('size', new THREE.BufferAttribute(sizes, 1));
+            particlesGeometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+            
+            // Use a custom ShaderMaterial for high performance and creative effects
+            // This is the key to 60 FPS on mobile! All particle updates are in the GPU.
+            const particleMaterial = new THREE.ShaderMaterial({
+                uniforms: {
+                    time: { value: 0 },
+                    handPos: { value: STATE.handPosition },
+                    openness: { value: STATE.handOpenness },
+                    sizeFactor: { value: 1.0 },
+                    // Simple glow texture (must be a square)
+                    pointTexture: { value: new THREE.TextureLoader().load('data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABAAQMAAACp+KnOAAAABlBMVEUAAAD///+x3tSAAAAAAXRSTlMAQObYZgAAAFpJREFUeNpjYBgFo2AUjIJRMApGAlQICMDAwICjX0Fk7e/n3/9fE8jIyoGBAQYI/s/AwOD/D9g/B44gAwxAG/z/g3Mv/wQgwQ9g/z+g4A/fAGP+/39AwJ8BADC6C+K6wWvWAAAAAElFTkSuQmCC') }
+                },
+                vertexShader: getVertexShader(),
+                fragmentShader: getFragmentShader(),
+                blending: THREE.AdditiveBlending, // Key for the glow effect
+                depthTest: false,
+                transparent: true
+            });
+
+            return new THREE.Points(particlesGeometry, particleMaterial);
+        }
+
+        // --- PART 4: SHADER CODE (The Creative Core) ---
+
+        // Custom particle movement logic on the GPU
+        function getVertexShader() {
+            // Note: MediaPipe coordinates are in the 0-1 range. Our handPos is scaled to ~(-3, 3).
+            return `
+                attribute vec3 velocity;
+                attribute float size;
+                attribute vec3 color;
+
+                uniform float time;
+                uniform vec3 handPos;
+                uniform float openness;
+                uniform float sizeFactor;
+                
+                varying vec3 vColor;
+                
+                void main() {
+                    vColor = color;
+                    
+                    // --- PARTICLE PHYSICS & INTERACTION ---
+                    
+                    // 1. Current Position
+                    vec3 p = position;
+                    
+                    // 2. Vector from particle to hand
+                    vec3 dirToHand = handPos - p;
+                    float distToHand = length(dirToHand);
+                    
+                    // 3. Hand-State-based Force
+                    float maxDist = 3.0;
+                    float distRatio = clamp(1.0 - (distToHand / maxDist), 0.0, 1.0);
+                    
+                    // Force blends between Attraction (openness=1) and Explosion (openness=0)
+                    // Attraction Force (Swirl): Attracts and adds a subtle swirl (cross product)
+                    vec3 attractForce = normalize(dirToHand) * 0.05 + cross(dirToHand, vec3(0.0, 0.0, 0.1)) * 0.01;
+                    
+                    // Explosion Force (Repel): Pushes away from the hand
+                    vec3 repelForce = normalize(dirToHand) * -0.5 * pow(distRatio, 4.0);
+                    
+                    // Interpolate force based on openness
+                    vec3 interactionForce = mix(repelForce, attractForce, openness);
+                    
+                    // Apply interaction force based on proximity and blend with a subtle noise/time-based drift
+                    vec3 force = interactionForce * distRatio;
+                    
+                    // 4. Update Position (Simple integration, for demonstration)
+                    // NOTE: For true physics, you'd update this in JS and pass as a custom attribute.
+                    // For a fun, dynamic visual effect, we'll use a simplified positional offset based on time and force.
+                    
+                    // We'll skip complex physics in the vertex shader for the initial demo to hit 60 FPS.
+                    // Instead, we just use the calculated 'interactionForce' to influence the final position
+                    
+                    // For a true 60 FPS mobile system, we use a single, pre-calculated physics loop in JS 
+                    // and update the positions buffer, but for this creative demo, let's use the hand position
+                    // as a positional attractor in the shader.
+                    
+                    // Attraction/Repulsion Position Offset (based on openness and proximity)
+                    vec3 offset = normalize(dirToHand) * (openness * 0.5 - 0.25) * pow(distRatio, 2.0) * 0.5;
+
+                    // Final Position: base position + time-based noise + offset
+                    vec4 mvPosition = modelViewMatrix * vec4(position + offset, 1.0);
+
+                    // --- PARTICLE VISUALS ---
+
+                    // Particle size: Scale with depth (perspective) and hand openness (pulse effect)
+                    gl_PointSize = size * (1.0 + openness * 10.0 * distRatio) * (sizeFactor / -mvPosition.z);
+                    
+                    // Clamp size to prevent massive particles on mobile
+                    gl_PointSize = clamp(gl_PointSize, 5.0, 150.0);
+
+                    gl_Position = projectionMatrix * mvPosition;
+                }
+            `;
+        }
+
+        // Custom particle appearance logic on the GPU
+        function getFragmentShader() {
+            // Frag shader applies the color, glow, and motion blur (via texture/additive blend)
+            return `
+                uniform sampler2D pointTexture;
+                varying vec3 vColor;
+                
+                void main() {
+                    // Soft, radial glow texture lookup
+                    vec4 textureColor = texture2D(pointTexture, gl_PointCoord);
+                    
+                    // Motion blur/depth effect: darken based on proximity to edge (simple vignette)
+                    float edgeFade = 1.0 - pow(length(gl_PointCoord - 0.5) * 2.0, 2.0);
+                    
+                    // Final Color: Blended with the texture and the vertex color
+                    gl_FragColor = textureColor * vec4(vColor, 1.0) * edgeFade;
+
+                    // Fade out particles that are fully transparent (optimization)
+                    if (gl_FragColor.a < 0.001) discard;
+                }
+            `;
+        }
+
+        // --- PART 5: ANIMATION LOOP ---
+
+        function animate(renderer, scene, camera, particleSystem) {
+            requestAnimationFrame((t) => animate(renderer, scene, camera, particleSystem));
+
+            const material = particleSystem.material;
+            
+            // 1. Update Uniforms
+            material.uniforms.time.value = t * 0.001;
+            // Update the hand position (which is being smoothly eased in the MediaPipe results handler)
+            material.uniforms.handPos.value = STATE.handPosition;
+            // Update the openness uniform
+            material.uniforms.openness.value = STATE.handOpenness;
+            
+            // Add a subtle camera movement/rotation for depth perception
+            // camera.rotation.z = Math.sin(t * 0.0001) * 0.05;
+            // camera.position.x = Math.cos(t * 0.0002) * 0.1;
+            
+            // 2. Render
+            renderer.render(scene, camera);
+        }
+        
+    </script>
+</body>
+</html>
